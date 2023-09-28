@@ -25,6 +25,23 @@ typedef enum PIMSTATUS {
     
 } PIMSTATUS;
 
+
+class PIMBasicInfo {
+public:
+    static PIMBasicInfo& getInstance() {
+        static PIMBasicInfo instance;
+        return instance;
+    }
+public:
+    PIMBasicInfo(const PIMBasicInfo&) = delete;
+    PIMBasicInfo(PIMBasicInfo&&) = delete;
+    PIMBasicInfo& operator=(const PIMBasicInfo&) = delete;
+    PIMBasicInfo& operator=(PIMBasicInfo&&) = delete;
+private:
+    PIMBasicInfo() = default;
+    ~PIMBasicInfo() = default;
+};
+
 typedef enum ShiftDirection {
     ShiftRight, ShiftLeft,
 } ShiftDirection;

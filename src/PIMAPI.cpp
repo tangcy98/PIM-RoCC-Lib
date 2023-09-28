@@ -5,6 +5,12 @@ namespace PIMAPI {
     ScratchPad scratchpad;
 }
 
+
+namespace PIMAPI {
+unique_ptr<PIMBasicInfo> PIMBasicInfo::_pinstance(new PIMBasicInfo);
+}
+
+
 inline static void  PIMAPI::printException(PIMSTATUS e)
 {
     switch (e)
