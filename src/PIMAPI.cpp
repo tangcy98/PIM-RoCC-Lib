@@ -1,9 +1,41 @@
 #include "PIMAPI.h"
 
+template <typename T> static T nextPOT(T x)
+{
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x+1;
+}
+
+template <typename T> static T lastPOT(T x)
+{
+    x += (++x)%2;
+    x >>= 1;
+    --x;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x+1;
+}
+
+
+
 namespace PIMAPI {
+using BasicComputeType = PIMBlocks::BasicComputeType;
+static void printException(PIMSTATUS e);
 
 // std::unique_ptr<i64> PIMAPI::blockflags(new i64[
 //   (PIMBasicInfo::getInstance().params._subarrnums+sizeof(i64)*8-1) / (sizeof(i64)*8)]);
+
+PIMBlocks::_pim_space_collector PIMBlocks::_collector;
+
+ScratchPad PIMBlocks::_sp(PIMBasicInfo::getInstance().params._scratchpad_size);
 
 PIMBasicInfo::PIMBasicInfo()
 {
@@ -23,82 +55,395 @@ PIMBasicInfo::PIMBasicInfo()
     }
 }
 
-PIMBlocks* PIMBlocks::PIMalloc(size_t size)
+
+PIMBlocks* PIMBlocks::PIMalloc(size_t size, unsigned int extracoe)
 {
-    if (size<0) {
+    static const PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
+    if (size<=0 || extracoe<=0) {
         return nullptr;
     }
-    PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
-    PIMBlocks *newblock = new PIMBlocks(size);
-    // 1. query for idle pimblocks
-    // asm volatile (
-    //   "rocc.status %[input_a]"
-    //   : 
-    //   : [input_a] "r" (blockflags.get())
-    //   : "memory");
-    
-    // 2. lock
-    int blocks = newblock->_blocknum;
-    for (u16 i = 0; i < piminfo.params._max_usable_subarr && blocks > 0; i+=piminfo.params._ctrl_subarr_per_inst) {
-        int locked;
-        asm volatile (
-          "rocc.lock %[result], %[input_a]"
-          : [result] "=r" (locked)
-          : [input_a] "r" (i)
-          : "memory");
-        if (locked) {
-            blocks -= piminfo.params._max_usable_subarr;
-            newblock->blocks.push_back(i);
-        }
-    }
 
-    // 3. failed -> unlock the locked blocks
-    if (blocks > 0) {
-        for (auto &i : newblock->blocks) {
-            asm volatile (
-            "rocc.unlock %[input_a]"
-            : 
-            : [input_a] "r" (i)
-            : "memory");
-        }
+    PIMBlocks *newblock = new PIMBlocks(size, extracoe);
+    if (newblock->_baseaddr >= piminfo.params._subarrnums) {
         delete newblock;
         return nullptr;
     }
-    _collector.s.insert(newblock);
+    if (newblock) {
+        _collector.s.insert(newblock);
+    }
     return newblock;
 }
 
 PIMSTATUS PIMBlocks::PIMfree(PIMBlocks* b)
 {
-    if (b == nullptr) {
+    if (!b) {
         return WRONGARG;
     }
     delete b;
     _collector.s.erase(b);
+    return OK;
 }
 
-PIMBlocks::PIMBlocks(size_t size):_datasize(size)
+PIMBlocks::PIMBlocks(size_t size, unsigned int extracoe):_datasize(size)
 {
-    PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
-    _blocknum = (size + piminfo.params._subarr_cols - 1) / piminfo.params._subarr_cols;
+    static const PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
+    _datablocks = (size + piminfo.params._subarr_cols - 1) / piminfo.params._subarr_cols;
+    _totalblocks = _datablocks * extracoe;
+    _capacity = _totalblocks * piminfo.params._subarr_cols;
+    asm volatile (
+        "rocc.lock %[result], %[input_a], %[input_b]"
+        : [result] "=r" (_baseaddr)
+        : [input_a] "r" (size), 
+          [input_b] "r" (_totalblocks)
+        : "memory");
 }
 
 PIMBlocks::~PIMBlocks()
 {
-    for (auto &i : blocks) {
+    static const PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
+    if (_baseaddr < piminfo.params._subarrnums) {
         asm volatile (
-        "rocc.unlock %[input_a]"
+        "rocc.unlock %[input_a],%[input_b]"
         : 
-        : [input_a] "r" (i)
+        : [input_a] "r" (_baseaddr),
+          [input_b] "r" (_totalblocks)
         : "memory");
     }
 }
 
+PIMSTATUS PIMBlocks::PIMVload(void *addr, u8 bits, u16 rowidx, size_t len)
+{
+    // should we ignore len check for performance?
+    if (len > _datasize) {
+        return VLENCONSTRAINT;
+    }
+    len = (len==0 ? _datasize : len);
+    static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
+    size_t addroffsetstride = bits<=8 ? 1 : (bits<=16 ? 2 : (bits<=32 ? 4 : (bits<=64 ? 8 : 16)));
 
+    for (size_t offset=0, idx=0, addroffset=(size_t)(addr); 
+      offset < len; 
+      offset+=info.params._ctrl_cols_stride, ++idx, addroffset+=addroffsetstride)
+    {
+        int flags;
+        asm volatile (
+            "rocc.vload %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((void*)(addroffset)),
+              [input_b] "r" ((u32)(bits) | ((u32)(rowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+            : "memory");
+        if (!flags) {
+            // Do not use try-catch because exception
+            // might be a normal situation
+            return UNKNOWN;
+        }
+    }
+    return OK;
+}
 
-}   // end of namespace PIMAPI
+PIMSTATUS PIMBlocks::PIMSload(u64 num, u8 bits, u16 rowidx, size_t len)
+{
+    // should we ignore len check for performance?
+    if (len > _datasize) {
+        return VLENCONSTRAINT;
+    }
+    len = (len==0 ? _datasize : len);
+    static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
 
-inline static void  PIMAPI::printException(PIMSTATUS e)
+    for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+        int flags;
+        asm volatile (
+            "rocc.sload %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" (num),
+              [input_b] "r" ((u32)(bits) | ((u32)(rowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+            : "memory");
+        if (!flags) {
+            return UNKNOWN;
+        }
+    }
+    return OK;
+}
+
+PIMSTATUS PIMBlocks::PIMVstore(void *addr, u8 bits, u16 rowidx, size_t len)
+{
+    // should we ignore len check for performance?
+    if (len > _datasize) {
+        return VLENCONSTRAINT;
+    }
+    len = (len==0 ? _datasize : len);
+    static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
+    size_t addroffsetstride = bits<=8 ? 1 : (bits<=16 ? 2 : (bits<=32 ? 4 : (bits<=64 ? 8 : 16)));
+
+    for (size_t offset=0, idx=0, addroffset=(size_t)(addr); 
+      offset < len; 
+      offset+=info.params._ctrl_cols_stride, ++idx, addroffset+=addroffsetstride)
+    {
+        int flags;
+        asm volatile (
+            "rocc.vstore %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((void*)(addroffset)),
+              [input_b] "r" ((u32)(bits) | ((u32)(rowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+            : "memory");
+        if (!flags) {
+            return UNKNOWN;
+        }
+    }
+    return OK;
+}
+
+PIMSTATUS PIMBlocks::PIMVcopy(u8 bits, u16 srcrowidx, u16 destrowidx, size_t len)
+{
+    // should we ignore len check for performance?
+    if (len > _datasize) {
+        return VLENCONSTRAINT;
+    }
+    len = (len==0 ? _datasize : len);
+    static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
+
+    for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+        int flags;
+        asm volatile (
+            "rocc.vcopy %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+              [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+            : "memory");
+        if (!flags) {
+            return UNKNOWN;
+        }
+    }
+    return OK;
+}
+
+PIMSTATUS PIMBlocks::PIMcompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, u16 destrowidx, size_t len)
+{
+    // should we ignore len check for performance?
+    if (len > _datasize) {
+        return VLENCONSTRAINT;
+    }
+    len = (len==0 ? _datasize : len);
+    static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
+
+    switch (ctype)
+    {
+    case PIMNOT:
+        /* code */
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vnot %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMAND:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vand %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+    case PIMOR:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vor %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMNOR:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vnor %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMXOR:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vxor %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMADD:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vadd %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMSUB:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vsub %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMMUL:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vmul %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    case PIMCMP:
+        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
+            int flags;
+            asm volatile (
+                "rocc.vcmp %[result], %[input_a], %[input_b]"
+                : [result] "=r" (flags)
+                : [input_a] "r" ((u64)(destrowidx)),
+                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+                : "memory");
+            if (!flags) {
+                return UNKNOWN;
+            }
+        }
+        break;
+
+    default:
+        return WRONGARG;
+        break;
+    }
+
+    return OK;
+}
+
+PIMSTATUS PIMBlocks::PIMloadcomputestore(BasicComputeType ctype, void **srcaddr, void *destaddr, u8 bits, size_t len)
+{
+    PIMSTATUS status;
+    int opnum;
+    // 1. load
+    if ((status = PIMVload(srcaddr[0], bits, 0, len)) != OK) {
+        return status;
+    }
+    if (ctype > PIM1OPMAX) {
+        opnum=2;
+        if ((status = PIMVload(srcaddr[1], bits, bits, len)) != OK) {
+            return status;
+        }
+    }
+    if (ctype > PIM2OPMAX) {
+        opnum=3;
+        if ((status = PIMVload(srcaddr[2], bits, bits+bits, len)) != OK) {
+            return status;
+        }
+    }
+
+    // 2. compute
+    if ((status = PIMcompute(ctype, bits, 0, bits*opnum, len)) != OK) {
+        return status;
+    }
+
+    // 3. store
+    if ((status = PIMVstore(destaddr, bits, bits*opnum, len)) != OK) {
+        return status;
+    }
+    return OK;
+}
+
+PIMSTATUS PIMBlocks::PIMSPexecute(std::string s, u16 srcrowidx, u16 destrowidx, size_t len)
+{
+    static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
+    s += '-' + std::to_string(_totalblocks/_datablocks);
+    DLinkedNode* pnode =  _sp.get(s);
+    int flags;
+
+    // 1. If not exist, load inst.
+    if (!pnode) {
+        spinst_ptr _ip = SPInstPool::getSPInst(s);
+        pnode = _ip ? _sp.put(s, _ip) : nullptr;
+        if (!pnode) {
+            return UNKNOWN;
+        }
+        asm volatile (
+            "rocc.spload %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" (pnode->instptr),
+              [input_b] "r" (pnode->spidx)
+            : "memory");
+        if (!flags) {
+            return UNKNOWN;
+        }
+    }
+
+    // 2. Execute the inst
+    asm volatile (
+        "rocc.spexec %[result], %[input_a], %[input_b]"
+        : [result] "=r" (flags)
+        : [input_a] "r" ((u64)(destrowidx)),
+          [input_b] "r" (((u32)(srcrowidx)+(u32)(_baseaddr)*(u32)(info.params._subarr_rows)) << 8)
+        : "memory");
+    if (!flags) {
+        return UNKNOWN;
+    }
+
+    return OK;
+}
+
+static void  printException(PIMSTATUS e)
 {
     switch (e)
     {
@@ -122,422 +467,5 @@ inline static void  PIMAPI::printException(PIMSTATUS e)
     }
 }
 
+}   // end of namespace PIMAPI
 
-// inline PIMAPI::PIMSTATUS    PIMAPI::ROCC_CONFIG (const uint32 &length, const uint32 &bits)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     }
-//     asm volatile (
-//         "rccfg %[result], %[input_a], %[input_b]"   /// no inst loading
-//         : [result] "=r" (dest_addr)
-//         : [input_b] "r" (scratchpad.len));
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_NOT(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_SQUAREROOT_INT(void *src_addr, void *dest_addr, const int32 &length)
-// {
-//     uint32 size;
-//     try {
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//     }
-
-
-//     asm volatile (
-//         "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//         : [result] "=r" (dest_addr)
-//         : [input_b] "r" (scratchpad.len));
-
-
-//     asm volatile (
-//           "rcmul %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_AND(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_OR(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_XOR(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_NOT(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_NOT(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_NOT(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_NOT(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
-
-// PIMAPI::PIMSTATUS   PIMAPI::ROCC_NOT(void *src_addr, void *dest_addr, const int32 &length, const int32 &bits=32)
-// {
-//     uint32 size;
-//     try {
-//         if (bits > 64 || bits < 8 || bits%2) {
-//             throw INVALIDBITS;
-//         }
-//         if (length % ArraySize) {
-//             throw VLENCONSTRAINT;
-//         }
-//         LOCK_PIM();
-//         size = GETMEMSIZE();
-//         if (size <= 0) {
-//             UNLOCK_PIM();
-//             throw MEMFULL;
-//         }
-//         UNLOCK_PIM();
-//     }
-//     catch (PIMSTATUS e) {
-//         printException(e);
-//         return e;
-//     };
-
-//     if (scratchpad.len != length) {
-//         scratchpad.len = length;
-//         asm volatile (
-//             "rcld7 %[result], %%x0, %[input_b]"   /// no inst loading
-//             : [result] "=r" (dest_addr)
-//             : [input_b] "r" (scratchpad.len));
-//     }
-
-//     asm volatile (
-//           "rcnot %[result], %[input_a], %%x0"   /// need only one reg
-//           : [result] "=r" (dest_addr)
-//           : [input_a] "r" (src_addr)
-//           : "memory");     /// mem changed
-//     return OK;
-// }
