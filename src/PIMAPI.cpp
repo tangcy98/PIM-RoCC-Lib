@@ -40,13 +40,13 @@ ScratchPad PIMBlocks::_sp(PIMBasicInfo::getInstance().params._scratchpad_size);
 PIMBasicInfo::PIMBasicInfo()
 {
     try {
-        int flags = 1;
+        int flags = 0;
         asm volatile (
             "rocc.getinfo %[result], %[input_a]"
             : [result] "=r" (flags)
             : [input_a] "r" (&params)
             : "memory");
-        if (flags==0) {
+        if (flags!=0) {
             throw NOPIM;
         }
     }
@@ -55,16 +55,20 @@ PIMBasicInfo::PIMBasicInfo()
     }
 }
 
+u32 PIMBlocks::pimdest32(const u8 &bits, const u16 &offset)
+{
+    return ((u32)(bits) << 24) | ((u32)(offset) << 16) | (u32)(_baseaddr);
+}
 
-PIMBlocks* PIMBlocks::PIMalloc(size_t size, unsigned int extracoe)
+PIMBlocks* PIMBlocks::PIMalloc(size_t datasize, unsigned int extracoe)
 {
     static const PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
-    if (size<=0 || extracoe<=0) {
+    if (datasize<=0 || extracoe<=0) {
         return nullptr;
     }
 
-    PIMBlocks *newblock = new PIMBlocks(size, extracoe);
-    if (newblock->_baseaddr >= piminfo.params._subarrnums) {
+    PIMBlocks *newblock = new PIMBlocks(datasize, extracoe);
+    if (newblock->_baseaddr == piminfo.params._max_addrspace) {
         delete newblock;
         return nullptr;
     }
@@ -84,9 +88,10 @@ PIMSTATUS PIMBlocks::PIMfree(PIMBlocks* b)
     return OK;
 }
 
-PIMBlocks::PIMBlocks(size_t size, unsigned int extracoe):_datasize(size)
+PIMBlocks::PIMBlocks(size_t size, unsigned int extracoe)
 {
     static const PIMBasicInfo &piminfo = PIMBasicInfo::getInstance();
+    _datasize = size;
     _datablocks = (size + piminfo.params._subarr_cols - 1) / piminfo.params._subarr_cols;
     _totalblocks = _datablocks * extracoe;
     _capacity = _totalblocks * piminfo.params._subarr_cols;
@@ -111,6 +116,17 @@ PIMBlocks::~PIMBlocks()
     }
 }
 
+// TODO
+PIMSTATUS PIMBlocks::PIMResize(size_t datasize)
+{
+    if (datasize > _capacity) {
+        return WRONGARG;
+    }
+    _datasize = datasize;
+
+    return OK;
+}
+
 PIMSTATUS PIMBlocks::PIMVload(void *addr, u8 bits, u16 rowidx, size_t len)
 {
     // should we ignore len check for performance?
@@ -119,48 +135,41 @@ PIMSTATUS PIMBlocks::PIMVload(void *addr, u8 bits, u16 rowidx, size_t len)
     }
     len = (len==0 ? _datasize : len);
     static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
-    size_t addroffsetstride = bits<=8 ? 1 : (bits<=16 ? 2 : (bits<=32 ? 4 : (bits<=64 ? 8 : 16)));
 
-    for (size_t offset=0, idx=0, addroffset=(size_t)(addr); 
-      offset < len; 
-      offset+=info.params._ctrl_cols_stride, ++idx, addroffset+=addroffsetstride)
-    {
-        int flags;
-        asm volatile (
-            "rocc.vload %[result], %[input_a], %[input_b]"
-            : [result] "=r" (flags)
-            : [input_a] "r" ((void*)(addroffset)),
-              [input_b] "r" ((u32)(bits) | ((u32)(rowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-            : "memory");
-        if (!flags) {
-            // Do not use try-catch because exception
-            // might be a normal situation
-            return UNKNOWN;
-        }
+    int flags;
+    asm volatile (
+        "rocc.vload %[result], %[input_a], %[input_b]"
+        : [result] "=r" (flags)
+        : [input_a] "r" (addr),
+          [input_b] "r" (pimdest32(bits, rowidx))
+        : "memory");
+    if (!flags) {
+        // Do not use try-catch because exception
+        // exception might be a normal return
+        return UNKNOWN;
     }
     return OK;
 }
 
-PIMSTATUS PIMBlocks::PIMSload(u64 num, u8 bits, u16 rowidx, size_t len)
+PIMSTATUS PIMBlocks::PIMSload(u64 num, u8 bits, size_t len)
 {
-    // should we ignore len check for performance?
     if (len > _datasize) {
         return VLENCONSTRAINT;
     }
     len = (len==0 ? _datasize : len);
     static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
 
-    for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-        int flags;
-        asm volatile (
-            "rocc.sload %[result], %[input_a], %[input_b]"
-            : [result] "=r" (flags)
-            : [input_a] "r" (num),
-              [input_b] "r" ((u32)(bits) | ((u32)(rowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-            : "memory");
-        if (!flags) {
-            return UNKNOWN;
-        }
+    int flags;
+    asm volatile (
+        "rocc.sload %[result], %[input_a], %[input_b]"
+        : [result] "=r" (flags)
+        : [input_a] "r" (num),
+          [input_b] "r" (pimdest32(bits, 0))
+        : "memory");
+    if (!flags) {
+        // Do not use try-catch because exception
+        // exception might be a normal return
+        return UNKNOWN;
     }
     return OK;
 }
@@ -184,7 +193,7 @@ PIMSTATUS PIMBlocks::PIMVstore(void *addr, u8 bits, u16 rowidx, size_t len)
             "rocc.vstore %[result], %[input_a], %[input_b]"
             : [result] "=r" (flags)
             : [input_a] "r" ((void*)(addroffset)),
-              [input_b] "r" ((u32)(bits) | ((u32)(rowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
+              [input_b] "r" (pimdest32(bits, rowidx))
             : "memory");
         if (!flags) {
             return UNKNOWN;
@@ -202,22 +211,20 @@ PIMSTATUS PIMBlocks::PIMVcopy(u8 bits, u16 srcrowidx, u16 destrowidx, size_t len
     len = (len==0 ? _datasize : len);
     static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
 
-    for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-        int flags;
-        asm volatile (
-            "rocc.vcopy %[result], %[input_a], %[input_b]"
-            : [result] "=r" (flags)
-            : [input_a] "r" ((u64)(destrowidx)),
-              [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-            : "memory");
-        if (!flags) {
-            return UNKNOWN;
-        }
+    int flags;
+    asm volatile (
+        "rocc.vcopy %[result], %[input_a], %[input_b]"
+        : [result] "=r" (flags)
+        : [input_a] "r" ((u64)(destrowidx)),
+          [input_b] "r" (pimdest32(bits, srcrowidx))
+        : "memory");
+    if (!flags) {
+        return UNKNOWN;
     }
     return OK;
 }
 
-PIMSTATUS PIMBlocks::PIMcompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, u16 destrowidx, size_t len)
+PIMSTATUS PIMBlocks::PIMVVcompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, u16 destrowidx, size_t len)
 {
     // should we ignore len check for performance?
     if (len > _datasize) {
@@ -226,146 +233,95 @@ PIMSTATUS PIMBlocks::PIMcompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, 
     len = (len==0 ? _datasize : len);
     static const PIMBasicInfo &info = PIMBasicInfo::getInstance();
 
+    int flags;
     switch (ctype)
     {
     case PIMNOT:
         /* code */
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vnot %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vnot %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMAND:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vand %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vand %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
     case PIMOR:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vor %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vor %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMNOR:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vnor %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vnor %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMXOR:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vxor %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vxor %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMADD:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vadd %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vadd %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMSUB:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vsub %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vsub %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMMUL:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vmul %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vmul %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
 
     case PIMCMP:
-        for (size_t offset=0, idx=0; offset < len; offset+=info.params._ctrl_cols_stride, ++idx) {
-            int flags;
-            asm volatile (
-                "rocc.vcmp %[result], %[input_a], %[input_b]"
-                : [result] "=r" (flags)
-                : [input_a] "r" ((u64)(destrowidx)),
-                  [input_b] "r" ((u32)(bits) | ((u32)(srcrowidx)+(u32)(_baseaddr+idx)*(u32)(info.params._subarr_rows)) << 8)
-                : "memory");
-            if (!flags) {
-                return UNKNOWN;
-            }
-        }
+        asm volatile (
+            "rocc.vcmp %[result], %[input_a], %[input_b]"
+            : [result] "=r" (flags)
+            : [input_a] "r" ((u64)(destrowidx)),
+                [input_b] "r" (pimdest32(bits, srcrowidx))
+            : "memory");
         break;
-
     default:
         return WRONGARG;
         break;
+    }
+    if (!flags) {
+        return UNKNOWN;
     }
 
     return OK;
@@ -393,7 +349,7 @@ PIMSTATUS PIMBlocks::PIMloadcomputestore(BasicComputeType ctype, void **srcaddr,
     }
 
     // 2. compute
-    if ((status = PIMcompute(ctype, bits, 0, bits*opnum, len)) != OK) {
+    if ((status = PIMVVcompute(ctype, bits, 0, bits*opnum, len)) != OK) {
         return status;
     }
 

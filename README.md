@@ -3,8 +3,21 @@ API and ISA for calling PIM functions using RoCC-like instructions in C/C++
 
 
 
-## 基本介绍
-这篇文档用于定义了在C语言中调用ICRG PIM进行通用计算的ISA及编程接口。
+## 接口基本介绍
+
+这篇文档用于定义了在C语言中调用ICRG PIM进行通用计算的ISA及编程接口。该repo属于PIM工具链的用户层接口，向上由用户编写计算代码，向下由LLVM支持编译生成RISC-V端汇编代码与可执行代码。PIM内执行逻辑由状态机或PIMLC根据逻辑网表生成的布尔运算指令负责。
+
+### 接口设计基本要求
+
+这部分接口代码应尽量减少用户接触到不必要的信息，且需要满足一下若干条件：
+- 符合基本的`Malloc - Load - Compute - Store - Free`模型
+- Malloc阶段，用户需要输入所需计算资源大小，输出为分配得到的计算资源本身（可能为空）
+- Load阶段，用户向分配所得计算资源输入源数据地址（指针），数据位宽，数据长度（可选，有默认值），由于bit-serial计算模式的特殊性，需要写入的位置（即各个比特所在行）是否需要用户指定暂未定，有由用户指定和存在默认值两种方案。
+- Compute阶段，用户指定计算资源进行指定的计算，其中源数据为Load阶段所加载，最终在计算资源当中生成计算结果。由于bit-serial计算模式的特殊性，源操作数和目的操作数的位置（即各个比特所在行）是否需要用户指定暂未定，有由用户指定和存在默认值两种方案。
+- Store阶段，用户向分配所得计算资源输入目的数据地址（指针），数据位宽，数据长度（可选，有默认值），由于bit-serial计算模式的特殊性，需要读出的位置（即各个比特所在行）是否需要用户指定暂未定，有由用户指定和存在默认值两种方案。
+- Free阶段，用户需要输入需要释放的计算资源，输出为释放结果。
+
+
 
 
 ## ISA
@@ -14,6 +27,10 @@ API and ISA for calling PIM functions using RoCC-like instructions in C/C++
   funct7      rs2      rs1        funct3        rd      opcode          R-type
   funct7      rs2      rs1      xd xs1 xs2      rd      opcode          RoCC
 ```
+
+### ISA设计基本要求
+ISA设计同样应该对PIM底层的一些操作保持透明，但又要相较于用户层明确更加细节的信息。
+
 
 
 ### 指令分类

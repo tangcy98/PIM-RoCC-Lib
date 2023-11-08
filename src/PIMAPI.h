@@ -42,6 +42,7 @@ public:
       u16 _subarr_rows;///< count of rows in a sub-array
       u16 _subarr_cols;///< count of columns in a sub-array
       u16 _ctrl_cols_stride;    ///< _ctrl_subarr_per_inst *  _subarr_cols
+      u16 _max_addrspace;
     } params;
 public:
     // singleton getInstance
@@ -59,10 +60,23 @@ private:
     ~PIMBasicInfo() = default;
 };
 
+class PIMBase {
+protected:
+    size_t  _datasize;
+    size_t  _capacity;
+    pimaddr_t _baseaddr;
 
+public:
+    size_t  getDataSize() const {return _datasize;}
+    size_t  getCapacity() const {return _capacity;}
+    pimaddr_t getBaseAddr() const {return _baseaddr;}
+
+protected:
+    virtual u32 pimdest32(const u8 &bits, const u16 &offset) = 0;
+};
 
 /// @brief A user allocated PIM blocks
-class PIMBlocks {
+class PIMBlocks : public PIMBase {
 public:
     enum BasicComputeType {
         PIMNOT=0, PIM1OPMAX,
@@ -79,16 +93,9 @@ private:
         ~_pim_space_collector() { std::for_each(s.begin(),s.end(),[](PIMBlocks *const &p){delete p;}); }
     } _collector;   ///< this is used to release unreleased blocks
     static ScratchPad _sp;
-    size_t  _datasize;
-    size_t  _capacity;
-    pimaddr_t _baseaddr;
     u16  _datablocks;
     u16  _totalblocks;
-
 public:
-    size_t  getDataSize() const {return _datasize;}
-    size_t  getCapacity() const {return _capacity;}
-    pimaddr_t getBaseAddr() const {return _baseaddr;}
     size_t  getDataBlocks() const {return _datablocks;}
     size_t  getTotalBlocks() const {return _totalblocks;}
 public:
@@ -99,14 +106,18 @@ public:
 private:
     PIMBlocks(size_t size, unsigned int extracoe);
     ~PIMBlocks();
+
+    virtual u32 pimdest32(const u8 &bits, const u16 &offset) override;
 public:
+    PIMSTATUS PIMResize(size_t datasize);
     PIMSTATUS PIMVload(void *addr, u8 bits, u16 rowidx, size_t len=0);
     PIMSTATUS PIMVstore(void *addr, u8 bits, u16 rowidx, size_t len=0);
-    PIMSTATUS PIMSload(u64 num, u8 bits, u16 rowidx, size_t len=0);
+    PIMSTATUS PIMSload(u64 num, u8 bits, size_t len=0);
     PIMSTATUS PIMVcopy(u8 bits, u16 srcrowidx, u16 destrowidx, size_t len=0);
 
     ///< use existing data in PIM and just compute (need to know specific row index)
-    PIMSTATUS PIMcompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, u16 destrowidx, size_t len=0); ///< just compute
+    PIMSTATUS PIMVVcompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, u16 destrowidx, size_t len=0); ///< just compute
+    PIMSTATUS PIMVScompute(BasicComputeType ctype, u8 bits, u16 srcrowidx, u16 destrowidx, size_t len=0); ///< just compute
 
     ///< load data into PIM and store after compute (do not care detailed row information)
     PIMSTATUS PIMloadcomputestore(BasicComputeType ctype, void **srcaddr, void *destaddr, u8 bits, size_t len=0); ///< load and compute and store
